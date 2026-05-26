@@ -82,6 +82,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -121,6 +122,62 @@ int ggml_cuda_get_device() {
     return id;
 }
 
+static size_t ggml_cuda_managed_prefetch_reserve(int device, size_t size) {
+    static std::mutex mutex;
+    static std::array<bool, GGML_CUDA_MAX_DEVICES> initialized = {};
+    static std::array<size_t, GGML_CUDA_MAX_DEVICES> remaining = {};
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!initialized[device]) {
+        ggml_cuda_set_device(device);
+
+        size_t free = 0;
+        size_t total;
+        cudaError_t err = cudaMemGetInfo(&free, &total);
+        if (err != cudaSuccess) {
+            (void)cudaGetLastError();
+            free = 0;
+        }
+
+        remaining[device] = free;
+        initialized[device] = true;
+    }
+
+    const size_t reserved = std::min(size, remaining[device]);
+    remaining[device] -= reserved;
+    return reserved;
+}
+
+static void ggml_cuda_managed_advise_and_prefetch(void * ptr, size_t size, int device) {
+#if defined(GGML_USE_MUSA)
+    GGML_UNUSED(ptr);
+    GGML_UNUSED(size);
+    GGML_UNUSED(device);
+#else
+    cudaError_t err;
+
+    err = cudaMemAdvise(ptr, size, cudaMemAdviseSetPreferredLocation, cudaCpuDeviceId);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+    }
+
+    err = cudaMemAdvise(ptr, size, cudaMemAdviseSetAccessedBy, device);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+    }
+
+    const size_t prefetch_size = ggml_cuda_managed_prefetch_reserve(device, size);
+    if (prefetch_size == 0) {
+        return;
+    }
+
+    err = cudaMemPrefetchAsync(ptr, prefetch_size, device, cudaStreamPerThread);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+    }
+#endif // defined(GGML_USE_MUSA)
+}
+
 static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device, bool * managed) {
     ggml_cuda_set_device(device);
     cudaError_t err;
@@ -131,6 +188,9 @@ static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device,
         err = cudaMallocManaged(ptr, size);
         if (managed != nullptr) {
             *managed = err == cudaSuccess;
+        }
+        if (err == cudaSuccess) {
+            ggml_cuda_managed_advise_and_prefetch(*ptr, size, device);
         }
 #if defined(GGML_USE_HIP)
         if (err == hipSuccess) {

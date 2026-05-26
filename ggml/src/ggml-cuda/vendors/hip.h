@@ -86,7 +86,10 @@
 #define cudaMallocHost(ptr, size) hipHostMalloc(ptr, size, hipHostMallocDefault)
 #define cudaMallocManaged hipMallocManaged
 #define cudaMemAdvise hipMemAdvise
+#define cudaMemAdviseSetAccessedBy hipMemAdviseSetAccessedBy
+#define cudaMemAdviseSetPreferredLocation hipMemAdviseSetPreferredLocation
 #define cudaMemPrefetchAsync hipMemPrefetchAsync
+#define cudaCpuDeviceId hipCpuDeviceId
 #define cudaMemcpy hipMemcpy
 #define cudaMemcpyAsync hipMemcpyAsync
 #define cudaMemcpyPeerAsync hipMemcpyPeerAsync
