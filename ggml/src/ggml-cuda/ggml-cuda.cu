@@ -122,6 +122,56 @@ int ggml_cuda_get_device() {
     return id;
 }
 
+static cudaError_t ggml_cuda_mem_advise_host(const void * ptr, size_t size, cudaMemoryAdvise advice) {
+#if defined(GGML_USE_MUSA)
+    GGML_UNUSED(ptr);
+    GGML_UNUSED(size);
+    GGML_UNUSED(advice);
+    return cudaSuccess;
+#elif defined(CUDART_VERSION) && CUDART_VERSION >= 12000
+    cudaMemLocation location = {};
+    location.type = cudaMemLocationTypeHost;
+    location.id   = cudaCpuDeviceId;
+    return cudaMemAdvise(ptr, size, advice, location);
+#else
+    return cudaMemAdvise(ptr, size, advice, cudaCpuDeviceId);
+#endif
+}
+
+static cudaError_t ggml_cuda_mem_advise_device(const void * ptr, size_t size, cudaMemoryAdvise advice, int device) {
+#if defined(GGML_USE_MUSA)
+    GGML_UNUSED(ptr);
+    GGML_UNUSED(size);
+    GGML_UNUSED(advice);
+    GGML_UNUSED(device);
+    return cudaSuccess;
+#elif defined(CUDART_VERSION) && CUDART_VERSION >= 12000
+    cudaMemLocation location = {};
+    location.type = cudaMemLocationTypeDevice;
+    location.id   = device;
+    return cudaMemAdvise(ptr, size, advice, location);
+#else
+    return cudaMemAdvise(ptr, size, advice, device);
+#endif
+}
+
+static cudaError_t ggml_cuda_mem_prefetch_async(const void * ptr, size_t size, int device, cudaStream_t stream) {
+#if defined(GGML_USE_MUSA)
+    GGML_UNUSED(ptr);
+    GGML_UNUSED(size);
+    GGML_UNUSED(device);
+    GGML_UNUSED(stream);
+    return cudaSuccess;
+#elif defined(CUDART_VERSION) && CUDART_VERSION >= 12000
+    cudaMemLocation location = {};
+    location.type = cudaMemLocationTypeDevice;
+    location.id   = device;
+    return cudaMemPrefetchAsync(ptr, size, location, 0, stream);
+#else
+    return cudaMemPrefetchAsync(ptr, size, device, stream);
+#endif
+}
+
 static size_t ggml_cuda_managed_prefetch_reserve(int device, size_t size) {
     static std::mutex mutex;
     static std::array<bool, GGML_CUDA_MAX_DEVICES> initialized = {};
@@ -156,12 +206,12 @@ static void ggml_cuda_managed_advise_and_prefetch(void * ptr, size_t size, int d
 #else
     cudaError_t err;
 
-    err = cudaMemAdvise(ptr, size, cudaMemAdviseSetPreferredLocation, cudaCpuDeviceId);
+    err = ggml_cuda_mem_advise_host(ptr, size, cudaMemAdviseSetPreferredLocation);
     if (err != cudaSuccess) {
         (void)cudaGetLastError();
     }
 
-    err = cudaMemAdvise(ptr, size, cudaMemAdviseSetAccessedBy, device);
+    err = ggml_cuda_mem_advise_device(ptr, size, cudaMemAdviseSetAccessedBy, device);
     if (err != cudaSuccess) {
         (void)cudaGetLastError();
     }
@@ -171,7 +221,7 @@ static void ggml_cuda_managed_advise_and_prefetch(void * ptr, size_t size, int d
         return;
     }
 
-    err = cudaMemPrefetchAsync(ptr, prefetch_size, device, cudaStreamPerThread);
+    err = ggml_cuda_mem_prefetch_async(ptr, prefetch_size, device, cudaStreamPerThread);
     if (err != cudaSuccess) {
         (void)cudaGetLastError();
     }
@@ -837,9 +887,9 @@ static bool ggml_backend_cuda_managed_op(ggml_backend_buffer_t buffer, const voi
 
     cudaError_t err;
     if (prefetch) {
-        err = cudaMemPrefetchAsync(ptr, size, device, cudaStreamPerThread);
+        err = ggml_cuda_mem_prefetch_async(ptr, size, device, cudaStreamPerThread);
     } else {
-        err = cudaMemAdvise(ptr, size, advice, device);
+        err = ggml_cuda_mem_advise_device(ptr, size, (cudaMemoryAdvise) advice, device);
     }
 
     if (err != cudaSuccess) {
