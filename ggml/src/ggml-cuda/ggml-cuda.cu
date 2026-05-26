@@ -121,11 +121,17 @@ int ggml_cuda_get_device() {
     return id;
 }
 
-static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
+static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device, bool * managed) {
     ggml_cuda_set_device(device);
     cudaError_t err;
+    if (managed != nullptr) {
+        *managed = false;
+    }
     if (getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") != nullptr) {
         err = cudaMallocManaged(ptr, size);
+        if (managed != nullptr) {
+            *managed = err == cudaSuccess;
+        }
 #if defined(GGML_USE_HIP)
         if (err == hipSuccess) {
             // hipMemAdviseSetCoarseGrain is an optional performance hint;
@@ -143,6 +149,9 @@ static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device)
             }
 
             err = cudaMalloc(ptr, size);
+            if (managed != nullptr) {
+                *managed = false;
+            }
         }
 #endif // defined(GGML_USE_HIP)
     } else {
@@ -432,7 +441,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         size_t look_ahead_size = (size_t) (1.05 * size);
         look_ahead_size = 256 * ((look_ahead_size + 255)/256);
         ggml_cuda_set_device(device);
-        cudaError_t err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
+        cudaError_t err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device, nullptr);
         if (err == cudaErrorMemoryAllocation) {
             (void)cudaGetLastError();
             const size_t cached_bytes = pool_size;
@@ -440,7 +449,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
                            device, look_ahead_size/1024.0/1024.0, cached_bytes/1024.0/1024.0);
             CUDA_CHECK(cudaDeviceSynchronize());
             clear_pool();
-            err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
+            err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device, nullptr);
             if (err == cudaSuccess) {
                 GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: retry succeeded\n", device);
             }
@@ -624,10 +633,11 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
+    bool managed = false;
     std::string name;
 
-    ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
-        device(device), dev_ptr(dev_ptr),
+    ggml_backend_cuda_buffer_context(int device, void * dev_ptr, bool managed) :
+        device(device), dev_ptr(dev_ptr), managed(managed),
         name(GGML_CUDA_NAME + std::to_string(device)) {
     }
 
@@ -744,6 +754,77 @@ static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
+static bool ggml_backend_cuda_managed_op(ggml_backend_buffer_t buffer, const void * ptr, size_t size, int device, int advice, bool prefetch) {
+#if defined(GGML_USE_MUSA)
+    GGML_UNUSED(buffer);
+    GGML_UNUSED(ptr);
+    GGML_UNUSED(size);
+    GGML_UNUSED(device);
+    GGML_UNUSED(advice);
+    GGML_UNUSED(prefetch);
+    return false;
+#else
+    if (buffer == nullptr || ptr == nullptr || size == 0 || !ggml_backend_buffer_is_cuda(buffer)) {
+        return false;
+    }
+
+    ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+    if (!ctx->managed) {
+        return false;
+    }
+
+    ggml_cuda_set_device(ctx->device);
+
+    cudaError_t err;
+    if (prefetch) {
+        err = cudaMemPrefetchAsync(ptr, size, device, cudaStreamPerThread);
+    } else {
+        err = cudaMemAdvise(ptr, size, advice, device);
+    }
+
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        return false;
+    }
+
+    return true;
+#endif // defined(GGML_USE_MUSA)
+}
+
+bool ggml_backend_cuda_buffer_advise(ggml_backend_buffer_t buffer, int advice, int device) {
+    if (buffer == nullptr || !ggml_backend_buffer_is_cuda(buffer)) {
+        return false;
+    }
+
+    return ggml_backend_cuda_managed_op(buffer, ggml_backend_buffer_get_base(buffer), ggml_backend_buffer_get_size(buffer), device, advice, false);
+}
+
+bool ggml_backend_cuda_buffer_prefetch(ggml_backend_buffer_t buffer, int device) {
+    if (buffer == nullptr || !ggml_backend_buffer_is_cuda(buffer)) {
+        return false;
+    }
+
+    return ggml_backend_cuda_managed_op(buffer, ggml_backend_buffer_get_base(buffer), ggml_backend_buffer_get_size(buffer), device, 0, true);
+}
+
+bool ggml_backend_cuda_tensor_advise(const ggml_tensor * tensor, int advice, int device) {
+    if (tensor == nullptr || tensor->buffer == nullptr || !ggml_backend_buffer_is_cuda(tensor->buffer)) {
+        return false;
+    }
+
+    const size_t size = tensor->view_src == nullptr ? ggml_backend_buffer_get_alloc_size(tensor->buffer, tensor) : ggml_nbytes(tensor);
+    return ggml_backend_cuda_managed_op(tensor->buffer, tensor->data, size, device, advice, false);
+}
+
+bool ggml_backend_cuda_tensor_prefetch(const ggml_tensor * tensor, int device) {
+    if (tensor == nullptr || tensor->buffer == nullptr || !ggml_backend_buffer_is_cuda(tensor->buffer)) {
+        return false;
+    }
+
+    const size_t size = tensor->view_src == nullptr ? ggml_backend_buffer_get_alloc_size(tensor->buffer, tensor) : ggml_nbytes(tensor);
+    return ggml_backend_cuda_managed_op(tensor->buffer, tensor->data, size, device, 0, true);
+}
+
 static const ggml_backend_buffer_i ggml_backend_cuda_buffer_interface = {
     /* .free_buffer     = */ ggml_backend_cuda_buffer_free_buffer,
     /* .get_base        = */ ggml_backend_cuda_buffer_get_base,
@@ -780,7 +861,8 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
     ggml_cuda_set_device(buft_ctx->device);
 
     void * dev_ptr;
-    cudaError_t err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
+    bool managed;
+    cudaError_t err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device, &managed);
     if (err != cudaSuccess) {
         // clear the error
         (void)cudaGetLastError();
@@ -788,7 +870,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
         return nullptr;
     }
 
-    ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, dev_ptr);
+    ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, dev_ptr, managed);
 
     return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
 }
@@ -958,7 +1040,7 @@ static enum ggml_status ggml_backend_cuda_split_buffer_init_tensor(ggml_backend_
         // currently, init_tensor cannot fail, it needs to be fixed in ggml-backend first
         ggml_cuda_set_device(id);
         char * buf;
-        CUDA_CHECK(ggml_cuda_device_malloc((void**)&buf, size, id));
+        CUDA_CHECK(ggml_cuda_device_malloc((void**)&buf, size, id, nullptr));
 
         // set padding to 0 to avoid possible NaN values
         if (size > original_size) {
@@ -5595,6 +5677,18 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_unregister_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_unregister_host_buffer;
+    }
+    if (strcmp(name, "ggml_backend_cuda_buffer_advise") == 0) {
+        return (void *)ggml_backend_cuda_buffer_advise;
+    }
+    if (strcmp(name, "ggml_backend_cuda_buffer_prefetch") == 0) {
+        return (void *)ggml_backend_cuda_buffer_prefetch;
+    }
+    if (strcmp(name, "ggml_backend_cuda_tensor_advise") == 0) {
+        return (void *)ggml_backend_cuda_tensor_advise;
+    }
+    if (strcmp(name, "ggml_backend_cuda_tensor_prefetch") == 0) {
+        return (void *)ggml_backend_cuda_tensor_prefetch;
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;

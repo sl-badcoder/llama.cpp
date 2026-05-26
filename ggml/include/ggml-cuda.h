@@ -36,6 +36,12 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_split_buffer_type(
 // pinned host buffer for use with the CPU backend for faster copies between CPU and GPU
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type(void);
 
+// unified memory advice and prefetch
+GGML_BACKEND_API bool ggml_backend_cuda_buffer_advise  (ggml_backend_buffer_t buffer, int advice, int device);
+GGML_BACKEND_API bool ggml_backend_cuda_buffer_prefetch(ggml_backend_buffer_t buffer, int device);
+GGML_BACKEND_API bool ggml_backend_cuda_tensor_advise  (const struct ggml_tensor * tensor, int advice, int device);
+GGML_BACKEND_API bool ggml_backend_cuda_tensor_prefetch(const struct ggml_tensor * tensor, int device);
+
 GGML_BACKEND_API int  ggml_backend_cuda_get_device_count(void);
 GGML_BACKEND_API void ggml_backend_cuda_get_device_description(int device, char * description, size_t description_size);
 GGML_BACKEND_API void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * total);
