@@ -206,14 +206,23 @@ static void ggml_cuda_managed_advise_and_prefetch(void * ptr, size_t size, int d
 #else
     cudaError_t err;
 
-    err = ggml_cuda_mem_advise_host(ptr, size, cudaMemAdviseSetPreferredLocation);
-    if (err != cudaSuccess) {
-        (void)cudaGetLastError();
+    const bool use_advise   = getenv("GGML_CUDA_MANAGED_ADVISE")   != nullptr;
+    const bool use_prefetch = getenv("GGML_CUDA_MANAGED_PREFETCH") != nullptr;
+
+    if (use_advise) {
+        err = ggml_cuda_mem_advise_host(ptr, size, cudaMemAdviseSetPreferredLocation);
+        if (err != cudaSuccess) {
+            (void)cudaGetLastError();
+        }
+
+        err = ggml_cuda_mem_advise_device(ptr, size, cudaMemAdviseSetAccessedBy, device);
+        if (err != cudaSuccess) {
+            (void)cudaGetLastError();
+        }
     }
 
-    err = ggml_cuda_mem_advise_device(ptr, size, cudaMemAdviseSetAccessedBy, device);
-    if (err != cudaSuccess) {
-        (void)cudaGetLastError();
+    if (!use_prefetch) {
+        return;
     }
 
     const size_t prefetch_size = ggml_cuda_managed_prefetch_reserve(device, size);
