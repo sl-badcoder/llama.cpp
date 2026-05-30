@@ -906,6 +906,10 @@ static bool ggml_backend_cuda_managed_op(ggml_backend_buffer_t buffer, const voi
         return false;
     }
 
+    if (prefetch) {
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    }
+
     return true;
 #endif // defined(GGML_USE_MUSA)
 }
@@ -924,6 +928,15 @@ bool ggml_backend_cuda_buffer_prefetch(ggml_backend_buffer_t buffer, int device)
     }
 
     return ggml_backend_cuda_managed_op(buffer, ggml_backend_buffer_get_base(buffer), ggml_backend_buffer_get_size(buffer), device, 0, true);
+}
+
+bool ggml_backend_cuda_buffer_prefetch_to_device(ggml_backend_buffer_t buffer) {
+    if (buffer == nullptr || !ggml_backend_buffer_is_cuda(buffer)) {
+        return false;
+    }
+
+    ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+    return ggml_backend_cuda_managed_op(buffer, ggml_backend_buffer_get_base(buffer), ggml_backend_buffer_get_size(buffer), ctx->device, 0, true);
 }
 
 bool ggml_backend_cuda_tensor_advise(const ggml_tensor * tensor, int advice, int device) {
@@ -5802,6 +5815,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_buffer_prefetch") == 0) {
         return (void *)ggml_backend_cuda_buffer_prefetch;
+    }
+    if (strcmp(name, "ggml_backend_cuda_buffer_prefetch_to_device") == 0) {
+        return (void *)ggml_backend_cuda_buffer_prefetch_to_device;
     }
     if (strcmp(name, "ggml_backend_cuda_tensor_advise") == 0) {
         return (void *)ggml_backend_cuda_tensor_advise;

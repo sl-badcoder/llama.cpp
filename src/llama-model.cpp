@@ -23,6 +23,7 @@
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <functional>
@@ -1544,6 +1545,42 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
+        }
+    }
+
+    if (getenv("GGML_CUDA_MANAGED_PREFETCH") != nullptr) {
+        typedef bool (*ggml_backend_cuda_buffer_prefetch_to_device_t)(ggml_backend_buffer_t buffer);
+
+        size_t n_prefetched = 0;
+        size_t size_prefetched = 0;
+
+        for (auto & [_, bufs] : pimpl->ctxs_bufs) {
+            for (auto & buf : bufs) {
+                ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf.get());
+                ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+                if (dev == nullptr) {
+                    continue;
+                }
+
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                auto prefetch_fn = (ggml_backend_cuda_buffer_prefetch_to_device_t)
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_buffer_prefetch_to_device");
+                if (prefetch_fn == nullptr) {
+                    continue;
+                }
+
+                if (prefetch_fn(buf.get())) {
+                    n_prefetched++;
+                    size_prefetched += ggml_backend_buffer_get_size(buf.get());
+                }
+            }
+        }
+
+        if (n_prefetched > 0) {
+            LLAMA_LOG_INFO("%s: prefetched %zu CUDA managed model buffers to GPU (%.2f MiB)\n",
+                    __func__, n_prefetched, size_prefetched / 1024.0 / 1024.0);
+        } else {
+            LLAMA_LOG_INFO("%s: no CUDA managed model buffers were prefetched\n", __func__);
         }
     }
 
