@@ -783,28 +783,6 @@ static void ggml_backend_cuda_buffer_set_tensor(
         char * dst = (char *) tensor->data + offset;
 
         std::memcpy(dst, data, size);
-
-        if (getenv("GGML_CUDA_MANAGED_PREFETCH") != nullptr) {
-            ggml_cuda_set_device(ctx->device);
-
-            const size_t prefetch_size =
-                ggml_cuda_managed_prefetch_reserve(ctx->device, size);
-
-            if (prefetch_size > 0) {
-                cudaError_t err = ggml_cuda_mem_prefetch_async(
-                    dst,
-                    prefetch_size,
-                    ctx->device,
-                    cudaStreamPerThread);
-
-                if (err != cudaSuccess) {
-                    (void) cudaGetLastError();
-                } else {
-                    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
-                }
-            }
-        }
-
         return;
     }
 
@@ -852,31 +830,6 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(
                 src + i * stride_data,
                 size);
         }
-
-        if (getenv("GGML_CUDA_MANAGED_PREFETCH") != nullptr) {
-            ggml_cuda_set_device(ctx->device);
-
-            const size_t span =
-                n_copies == 1 ? size : (n_copies - 1) * stride_tensor + size;
-
-            const size_t prefetch_size =
-                ggml_cuda_managed_prefetch_reserve(ctx->device, span);
-
-            if (prefetch_size > 0) {
-                cudaError_t err = ggml_cuda_mem_prefetch_async(
-                    dst,
-                    prefetch_size,
-                    ctx->device,
-                    cudaStreamPerThread);
-
-                if (err != cudaSuccess) {
-                    (void) cudaGetLastError();
-                } else {
-                    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
-                }
-            }
-        }
-
         return;
     }
 
