@@ -172,65 +172,22 @@ static cudaError_t ggml_cuda_mem_prefetch_async(const void * ptr, size_t size, i
 #endif
 }
 
-static size_t ggml_cuda_managed_prefetch_reserve(int device, size_t size) {
-    static std::mutex mutex;
-    static std::array<bool, GGML_CUDA_MAX_DEVICES> initialized = {};
-    static std::array<size_t, GGML_CUDA_MAX_DEVICES> remaining = {};
-
-    std::lock_guard<std::mutex> lock(mutex);
-    if (!initialized[device]) {
-        ggml_cuda_set_device(device);
-
-        size_t free = 0;
-        size_t total;
-        cudaError_t err = cudaMemGetInfo(&free, &total);
-        if (err != cudaSuccess) {
-            (void)cudaGetLastError();
-            free = 0;
-        }
-
-        remaining[device] = free;
-        initialized[device] = true;
-    }
-
-    const size_t reserved = std::min(size, remaining[device]);
-    remaining[device] -= reserved;
-    return reserved;
-}
-
-static void ggml_cuda_managed_advise_and_prefetch(void * ptr, size_t size, int device) {
+static void ggml_cuda_managed_advise(void * ptr, size_t size, int device) {
 #if defined(GGML_USE_MUSA)
     GGML_UNUSED(ptr);
     GGML_UNUSED(size);
     GGML_UNUSED(device);
 #else
-    cudaError_t err;
-
-    const bool use_advise   = getenv("GGML_CUDA_MANAGED_ADVISE")   != nullptr;
-    const bool use_prefetch = getenv("GGML_CUDA_MANAGED_PREFETCH") != nullptr;
-
-    if (use_advise) {
-        err = ggml_cuda_mem_advise_host(ptr, size, cudaMemAdviseSetPreferredLocation);
-        if (err != cudaSuccess) {
-            (void)cudaGetLastError();
-        }
-
-        err = ggml_cuda_mem_advise_device(ptr, size, cudaMemAdviseSetAccessedBy, device);
-        if (err != cudaSuccess) {
-            (void)cudaGetLastError();
-        }
-    }
-
-    if (!use_prefetch) {
+    if (getenv("GGML_CUDA_MANAGED_ADVISE") == nullptr) {
         return;
     }
 
-    const size_t prefetch_size = ggml_cuda_managed_prefetch_reserve(device, size);
-    if (prefetch_size == 0) {
-        return;
+    cudaError_t err = ggml_cuda_mem_advise_host(ptr, size, cudaMemAdviseSetPreferredLocation);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
     }
 
-    err = ggml_cuda_mem_prefetch_async(ptr, prefetch_size, device, cudaStreamPerThread);
+    err = ggml_cuda_mem_advise_device(ptr, size, cudaMemAdviseSetAccessedBy, device);
     if (err != cudaSuccess) {
         (void)cudaGetLastError();
     }
@@ -249,7 +206,10 @@ static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device,
             *managed = err == cudaSuccess;
         }
         if (err == cudaSuccess) {
-            ggml_cuda_managed_advise_and_prefetch(*ptr, size, device);
+            // Advice only changes the migration policy and is safe before initialization.
+            // Prefetching here races tensor uploads on other streams and can migrate
+            // uninitialized pages. Model buffers are prefetched after loading instead.
+            ggml_cuda_managed_advise(*ptr, size, device);
         }
 #if defined(GGML_USE_HIP)
         if (err == hipSuccess) {
