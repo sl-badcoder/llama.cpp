@@ -39,7 +39,7 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type(v
 // unified memory advice and prefetch
 GGML_BACKEND_API bool ggml_backend_cuda_buffer_advise  (ggml_backend_buffer_t buffer, int advice, int device);
 GGML_BACKEND_API bool ggml_backend_cuda_buffer_prefetch(ggml_backend_buffer_t buffer, int device);
-GGML_BACKEND_API bool ggml_backend_cuda_buffer_prefetch_to_device(ggml_backend_buffer_t buffer);
+GGML_BACKEND_API size_t ggml_backend_cuda_buffer_prefetch_to_device(ggml_backend_buffer_t buffer);
 GGML_BACKEND_API bool ggml_backend_cuda_tensor_advise  (const struct ggml_tensor * tensor, int advice, int device);
 GGML_BACKEND_API bool ggml_backend_cuda_tensor_prefetch(const struct ggml_tensor * tensor, int device);
 

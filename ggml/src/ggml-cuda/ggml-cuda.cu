@@ -792,12 +792,6 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     if (ctx->managed) {
         void * dst = (char *) tensor->data + offset;
         std::memcpy(dst, data, size);
-
-        if (getenv("GGML_CUDA_MANAGED_PREFETCH") != nullptr && size > 0) {
-            ggml_cuda_set_device(ctx->device);
-            CUDA_CHECK(ggml_cuda_mem_prefetch_async(dst, size, ctx->device, cudaStreamPerThread));
-            CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
-        }
         return;
     }
 
@@ -834,13 +828,6 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
         const char * src = (const char *) data;
         for (size_t i = 0; i < n_copies; ++i) {
             std::memcpy(dst + i * stride_tensor, src + i * stride_data, size);
-        }
-
-        if (getenv("GGML_CUDA_MANAGED_PREFETCH") != nullptr && size > 0 && n_copies > 0) {
-            const size_t span = (n_copies - 1) * stride_tensor + size;
-            ggml_cuda_set_device(ctx->device);
-            CUDA_CHECK(ggml_cuda_mem_prefetch_async(dst, span, ctx->device, cudaStreamPerThread));
-            CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
         }
         return;
     }
@@ -905,6 +892,78 @@ static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
+static size_t ggml_cuda_managed_prefetch_headroom() {
+    static constexpr size_t default_headroom = 256 * 1024 * 1024;
+    const char * value = getenv("GGML_CUDA_MANAGED_PREFETCH_HEADROOM");
+    if (value == nullptr) {
+        return default_headroom;
+    }
+
+    char * end = nullptr;
+    const unsigned long long headroom_mib = strtoull(value, &end, 10);
+    if (end == value || *end != '\0' || headroom_mib > std::numeric_limits<size_t>::max() / (1024 * 1024)) {
+        GGML_LOG_WARN_ONCE("invalid GGML_CUDA_MANAGED_PREFETCH_HEADROOM; using 256 MiB\n");
+        return default_headroom;
+    }
+
+    return (size_t) headroom_mib * 1024 * 1024;
+}
+
+static size_t ggml_backend_cuda_managed_prefetch_range(
+        ggml_backend_buffer_t buffer, const void * ptr, size_t size, int device) {
+#if defined(GGML_USE_MUSA)
+    GGML_UNUSED(buffer);
+    GGML_UNUSED(ptr);
+    GGML_UNUSED(size);
+    GGML_UNUSED(device);
+    return 0;
+#else
+    if (buffer == nullptr || ptr == nullptr || size == 0 || !ggml_backend_buffer_is_cuda(buffer)) {
+        return 0;
+    }
+
+    ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+    if (!ctx->managed || device < 0 || device >= ggml_backend_cuda_get_device_count()) {
+        return 0;
+    }
+
+    // Serialize the free-memory query with the migration. Otherwise simultaneous
+    // callers could each observe and consume the same available VRAM.
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+
+    ggml_cuda_set_device(device);
+
+    size_t free = 0;
+    size_t total = 0;
+    cudaError_t err = cudaMemGetInfo(&free, &total);
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        return 0;
+    }
+
+    const size_t headroom = std::min(free, ggml_cuda_managed_prefetch_headroom());
+    const size_t budget = free - headroom;
+    const size_t prefetch_size = std::min(size, budget);
+    if (prefetch_size == 0) {
+        return 0;
+    }
+
+    err = ggml_cuda_mem_prefetch_async(ptr, prefetch_size, device, cudaStreamPerThread);
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        return 0;
+    }
+
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    GGML_LOG_DEBUG("%s: device %d prefetched %.2f MiB of %.2f MiB "
+            "(free %.2f MiB of %.2f MiB, headroom %.2f MiB)\n",
+            __func__, device, prefetch_size / 1024.0 / 1024.0, size / 1024.0 / 1024.0,
+            free / 1024.0 / 1024.0, total / 1024.0 / 1024.0, headroom / 1024.0 / 1024.0);
+    return prefetch_size;
+#endif // defined(GGML_USE_MUSA)
+}
+
 static bool ggml_backend_cuda_managed_op(ggml_backend_buffer_t buffer, const void * ptr, size_t size, int device, int advice, bool prefetch) {
 #if defined(GGML_USE_MUSA)
     GGML_UNUSED(buffer);
@@ -924,22 +983,15 @@ static bool ggml_backend_cuda_managed_op(ggml_backend_buffer_t buffer, const voi
         return false;
     }
 
-    ggml_cuda_set_device(ctx->device);
-
-    cudaError_t err;
     if (prefetch) {
-        err = ggml_cuda_mem_prefetch_async(ptr, size, device, cudaStreamPerThread);
-    } else {
-        err = ggml_cuda_mem_advise_device(ptr, size, (cudaMemoryAdvise) advice, device);
+        return ggml_backend_cuda_managed_prefetch_range(buffer, ptr, size, device) > 0;
     }
 
+    ggml_cuda_set_device(ctx->device);
+    cudaError_t err = ggml_cuda_mem_advise_device(ptr, size, (cudaMemoryAdvise) advice, device);
     if (err != cudaSuccess) {
         (void)cudaGetLastError();
         return false;
-    }
-
-    if (prefetch) {
-        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
     }
 
     return true;
@@ -962,13 +1014,14 @@ bool ggml_backend_cuda_buffer_prefetch(ggml_backend_buffer_t buffer, int device)
     return ggml_backend_cuda_managed_op(buffer, ggml_backend_buffer_get_base(buffer), ggml_backend_buffer_get_size(buffer), device, 0, true);
 }
 
-bool ggml_backend_cuda_buffer_prefetch_to_device(ggml_backend_buffer_t buffer) {
+size_t ggml_backend_cuda_buffer_prefetch_to_device(ggml_backend_buffer_t buffer) {
     if (buffer == nullptr || !ggml_backend_buffer_is_cuda(buffer)) {
-        return false;
+        return 0;
     }
 
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
-    return ggml_backend_cuda_managed_op(buffer, ggml_backend_buffer_get_base(buffer), ggml_backend_buffer_get_size(buffer), ctx->device, 0, true);
+    return ggml_backend_cuda_managed_prefetch_range(
+            buffer, ggml_backend_buffer_get_base(buffer), ggml_backend_buffer_get_size(buffer), ctx->device);
 }
 
 bool ggml_backend_cuda_tensor_advise(const ggml_tensor * tensor, int advice, int device) {
@@ -3390,9 +3443,6 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
     if (buf_ctx->managed) {
         void * dst = (char *) tensor->data + offset;
         std::memcpy(dst, data, size);
-        if (getenv("GGML_CUDA_MANAGED_PREFETCH") != nullptr && size > 0) {
-            CUDA_CHECK(ggml_cuda_mem_prefetch_async(dst, size, cuda_ctx->device, cuda_ctx->stream()));
-        }
         return;
     }
 
@@ -3432,10 +3482,6 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
         const char * src = (const char *) data;
         for (size_t i = 0; i < n_copies; ++i) {
             std::memcpy(dst + i * stride_tensor, src + i * stride_data, size);
-        }
-        if (getenv("GGML_CUDA_MANAGED_PREFETCH") != nullptr && size > 0 && n_copies > 0) {
-            const size_t span = (n_copies - 1) * stride_tensor + size;
-            CUDA_CHECK(ggml_cuda_mem_prefetch_async(dst, span, cuda_ctx->device, cuda_ctx->stream()));
         }
         return;
     }

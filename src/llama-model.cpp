@@ -1551,7 +1551,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // load_all_data() synchronizes outstanding tensor uploads before returning.
     // Managed model buffers can therefore be prefetched without overlapping their initialization.
     if (getenv("GGML_CUDA_MANAGED_PREFETCH") != nullptr) {
-        typedef bool (*ggml_backend_cuda_buffer_prefetch_to_device_t)(ggml_backend_buffer_t buffer);
+        typedef size_t (*ggml_backend_cuda_buffer_prefetch_to_device_t)(ggml_backend_buffer_t buffer);
 
         size_t n_prefetched = 0;
         size_t size_prefetched = 0;
@@ -1571,9 +1571,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     continue;
                 }
 
-                if (prefetch_fn(buf.get())) {
+                const size_t size = prefetch_fn(buf.get());
+                if (size > 0) {
                     n_prefetched++;
-                    size_prefetched += ggml_backend_buffer_get_size(buf.get());
+                    size_prefetched += size;
                 }
             }
         }
