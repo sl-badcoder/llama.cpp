@@ -209,8 +209,8 @@ static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device,
         }
         if (err == cudaSuccess) {
             // Advice only changes the migration policy and is safe before initialization.
-            // Prefetching here races tensor uploads on other streams and can migrate
-            // uninitialized pages. Model buffers are prefetched after loading instead.
+            // Do not start migration while the allocation is still uninitialized;
+            // model buffers are prefetched after all tensor uploads complete instead.
             ggml_cuda_managed_advise(*ptr, size, device);
         }
 #if defined(GGML_USE_HIP)
