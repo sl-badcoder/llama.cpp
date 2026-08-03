@@ -69,6 +69,7 @@
 #include <array>
 #include <atomic>
 #include <charconv>
+#include <chrono>
 #include <cinttypes>
 #include <condition_variable>
 #include <cstddef>
@@ -91,6 +92,25 @@ static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
 #define GGML_LOG_WARN_ONCE(str) \
     { static std::once_flag warn_flag; std::call_once(warn_flag, []() { GGML_LOG_WARN(str); }); }
+
+static bool ggml_cuda_managed_trace_enabled() {
+    return getenv("GGML_CUDA_MANAGED_TRACE") != nullptr;
+}
+
+static const char * ggml_cuda_managed_mode() {
+    const bool prefetch = getenv("GGML_CUDA_MANAGED_PREFETCH") != nullptr;
+    const bool advise = getenv("GGML_CUDA_MANAGED_ADVISE") != nullptr;
+    if (prefetch && advise) {
+        return "prefetch+advise";
+    }
+    if (prefetch) {
+        return "prefetch";
+    }
+    if (advise) {
+        return "advise";
+    }
+    return "managed";
+}
 
 [[noreturn]]
 void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg) {
@@ -297,6 +317,14 @@ static void ggml_cuda_managed_prefetch_init_budget(int device) {
                 __func__, device, budget.shared_available / 1024.0 / 1024.0,
                 free / 1024.0 / 1024.0, total / 1024.0 / 1024.0, headroom / 1024.0 / 1024.0);
     }
+    if (ggml_cuda_managed_trace_enabled()) {
+        fprintf(stderr, "UVM TRACE budget mode=%s device=%d free=%.2f_MiB total=%.2f_MiB "
+                "safety=%.2f_MiB shared=%.2f_MiB weight_max=%.2f_MiB runtime_guaranteed=%.2f_MiB\n",
+                ggml_cuda_managed_mode(), device, free / 1024.0 / 1024.0, total / 1024.0 / 1024.0,
+                headroom / 1024.0 / 1024.0, budget.shared_available / 1024.0 / 1024.0,
+                budget.weight_available / 1024.0 / 1024.0,
+                budget.runtime_guaranteed / 1024.0 / 1024.0);
+    }
 }
 
 static void ggml_cuda_managed_advise(void * ptr, size_t size, int device) {
@@ -332,6 +360,10 @@ static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device,
             *managed = err == cudaSuccess;
         }
         if (err == cudaSuccess) {
+            if (ggml_cuda_managed_trace_enabled()) {
+                fprintf(stderr, "UVM TRACE allocation mode=%s device=%d ptr=%p size=%.2f_MiB\n",
+                        ggml_cuda_managed_mode(), device, *ptr, size / 1024.0 / 1024.0);
+            }
             // Advice only changes the migration policy and is safe before initialization.
             // Do not start migration while the allocation is still uninitialized;
             // model buffers are prefetched after all tensor uploads complete instead.
@@ -424,12 +456,18 @@ static size_t ggml_cuda_managed_prefetch_range(
     // weight and runtime budgets so that weights cannot consume the runtime reserve.
     const bool runtime = priority == ggml_cuda_managed_prefetch_priority::runtime;
     const bool combined = getenv("GGML_CUDA_MANAGED_ADVISE") != nullptr;
+    const bool trace = ggml_cuda_managed_trace_enabled();
+    bool mapped = !combined;
+    double map_ms = 0.0;
 
     // Model and split buffers reach this point after their tensor uploads;
     // graph compute and KV buffers reach it after context initialization.
     // Establish the requested GPU mapping immediately before migration.
     if (combined) {
-        const bool mapped = ggml_cuda_managed_map_range(ptr, size, device);
+        const auto map_begin = std::chrono::steady_clock::now();
+        mapped = ggml_cuda_managed_map_range(ptr, size, device);
+        map_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - map_begin).count();
         GGML_LOG_DEBUG("%s: device %d %s %.2f MiB %s allocation immediately before prefetch\n",
                 __func__, device, mapped ? "mapped" : "failed to map",
                 size / 1024.0 / 1024.0, runtime ? "runtime" : "weight");
@@ -486,38 +524,103 @@ static size_t ggml_cuda_managed_prefetch_range(
         }
     }
     const size_t prefetch_size = std::min(size, remaining);
+    size_t free_before = 0;
+    size_t total_before = 0;
+    bool queried_free_before = false;
+    if (trace) {
+        const cudaError_t info_err = cudaMemGetInfo(&free_before, &total_before);
+        queried_free_before = info_err == cudaSuccess;
+        if (!queried_free_before) {
+            (void) cudaGetLastError();
+        }
+        fprintf(stderr, "UVM TRACE decision mode=%s class=%s device=%d ptr=%p allocation=%.2f_MiB "
+                "map=%s map_ms=%.3f selected=%.2f_MiB overflow=%.2f_MiB "
+                "class_used=%.2f_MiB class_limit=%.2f_MiB total_used=%.2f_MiB total_limit=%.2f_MiB "
+                "free_before=%s%.2f_MiB physical_total=%.2f_MiB\n",
+                ggml_cuda_managed_mode(), runtime ? "runtime" : "weight", device, ptr,
+                size / 1024.0 / 1024.0, combined ? (mapped ? "yes" : "failed") : "not-requested",
+                map_ms, prefetch_size / 1024.0 / 1024.0, (size - prefetch_size) / 1024.0 / 1024.0,
+                reserved / 1024.0 / 1024.0, available / 1024.0 / 1024.0,
+                (combined ? budget.weight_reserved + budget.runtime_prefetched : budget.shared_reserved) /
+                        1024.0 / 1024.0,
+                budget.shared_available / 1024.0 / 1024.0,
+                queried_free_before ? "" : "unavailable:", free_before / 1024.0 / 1024.0,
+                total_before / 1024.0 / 1024.0);
+    }
     if (prefetch_size == 0) {
+        bool host_preferred = false;
         if (combined) {
-            const bool advised = ggml_cuda_managed_prefer_host_range(ptr, size);
+            host_preferred = ggml_cuda_managed_prefer_host_range(ptr, size);
             GGML_LOG_DEBUG("%s: device %d has no %s prefetch budget; %s %.2f MiB allocation\n",
-                    __func__, device, runtime ? "runtime" : "weight", advised ? "made host-preferred" :
+                    __func__, device, runtime ? "runtime" : "weight", host_preferred ? "made host-preferred" :
                     "failed to set host preference for", size / 1024.0 / 1024.0);
+        }
+        if (trace) {
+            fprintf(stderr, "UVM TRACE result mode=%s class=%s device=%d ptr=%p prefetch=skipped "
+                    "host_preferred=%s reason=no-budget\n",
+                    ggml_cuda_managed_mode(), runtime ? "runtime" : "weight", device, ptr,
+                    combined ? (host_preferred ? "yes" : "failed") : "not-requested");
         }
         return 0;
     }
 
+    const auto prefetch_begin = std::chrono::steady_clock::now();
     cudaError_t err = ggml_cuda_mem_prefetch_async(ptr, prefetch_size, device, cudaStreamPerThread);
     if (err != cudaSuccess) {
+        const char * error_string = cudaGetErrorString(err);
         (void) cudaGetLastError();
+        bool host_preferred = false;
         if (combined) {
-            const bool advised = ggml_cuda_managed_prefer_host_range(ptr, size);
+            host_preferred = ggml_cuda_managed_prefer_host_range(ptr, size);
             GGML_LOG_DEBUG("%s: device %d %s prefetch failed; %s %.2f MiB allocation\n",
                     __func__, device, runtime ? "runtime" : "weight",
-                    advised ? "made host-preferred" : "failed to set host preference for",
+                    host_preferred ? "made host-preferred" : "failed to set host preference for",
                     size / 1024.0 / 1024.0);
+        }
+        if (trace) {
+            fprintf(stderr, "UVM TRACE result mode=%s class=%s device=%d ptr=%p prefetch=failed "
+                    "error=%s host_preferred=%s\n",
+                    ggml_cuda_managed_mode(), runtime ? "runtime" : "weight", device, ptr,
+                    error_string, combined ? (host_preferred ? "yes" : "failed") : "not-requested");
         }
         return 0;
     }
 
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    const double prefetch_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - prefetch_begin).count();
     reserved += prefetch_size;
 
+    bool overflow_preferred = false;
     if (combined && prefetch_size < size) {
         const void * overflow_ptr = (const char *) ptr + prefetch_size;
-        const bool advised = ggml_cuda_managed_prefer_host_range(overflow_ptr, size - prefetch_size);
+        overflow_preferred = ggml_cuda_managed_prefer_host_range(overflow_ptr, size - prefetch_size);
         GGML_LOG_DEBUG("%s: device %d %s %.2f MiB %s overflow after prefetch\n",
-                __func__, device, advised ? "made host-preferred" : "failed to set host preference for",
+                __func__, device, overflow_preferred ? "made host-preferred" : "failed to set host preference for",
                 (size - prefetch_size) / 1024.0 / 1024.0, runtime ? "runtime" : "weight");
+    }
+
+    if (trace) {
+        size_t free_after = 0;
+        size_t total_after = 0;
+        const cudaError_t info_err = cudaMemGetInfo(&free_after, &total_after);
+        const bool queried_free_after = info_err == cudaSuccess;
+        if (!queried_free_after) {
+            (void) cudaGetLastError();
+        }
+        const double free_delta_mib = queried_free_before && queried_free_after ?
+                ((double) free_before - (double) free_after) / 1024.0 / 1024.0 : 0.0;
+        fprintf(stderr, "UVM TRACE result mode=%s class=%s device=%d ptr=%p prefetch=success "
+                "migrated=%.2f_MiB prefetch_ms=%.3f free_after=%s%.2f_MiB physical_total=%.2f_MiB free_delta=%.2f_MiB "
+                "overflow_host_preferred=%s class_used_after=%.2f_MiB total_used_after=%.2f_MiB\n",
+                ggml_cuda_managed_mode(), runtime ? "runtime" : "weight", device, ptr,
+                prefetch_size / 1024.0 / 1024.0, prefetch_ms,
+                queried_free_after ? "" : "unavailable:", free_after / 1024.0 / 1024.0,
+                total_after / 1024.0 / 1024.0, free_delta_mib,
+                prefetch_size < size ? (combined ? (overflow_preferred ? "yes" : "failed") : "not-requested") : "none",
+                reserved / 1024.0 / 1024.0,
+                (combined ? budget.weight_reserved + budget.runtime_prefetched : budget.shared_reserved) /
+                        1024.0 / 1024.0);
     }
 
     GGML_LOG_DEBUG("%s: device %d prefetched %.2f MiB of %.2f MiB %s allocation "
