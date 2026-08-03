@@ -88,6 +88,8 @@
 #define cudaMemAdvise hipMemAdvise
 #define cudaMemAdviseSetAccessedBy hipMemAdviseSetAccessedBy
 #define cudaMemAdviseSetPreferredLocation hipMemAdviseSetPreferredLocation
+#define cudaMemAdviseUnsetAccessedBy hipMemAdviseUnsetAccessedBy
+#define cudaMemAdviseUnsetPreferredLocation hipMemAdviseUnsetPreferredLocation
 #define cudaMemPrefetchAsync hipMemPrefetchAsync
 #define cudaCpuDeviceId hipCpuDeviceId
 #define cudaMemcpy hipMemcpy
