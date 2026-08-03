@@ -240,8 +240,8 @@ struct ggml_cuda_managed_prefetch_budget {
     size_t shared_reserved = 0;
     size_t weight_available = 0;
     size_t weight_reserved = 0;
-    size_t runtime_available = 0;
-    size_t runtime_reserved = 0;
+    size_t runtime_guaranteed = 0;
+    size_t runtime_prefetched = 0;
     size_t total = 0;
 };
 
@@ -283,13 +283,13 @@ static void ggml_cuda_managed_prefetch_init_budget(int device) {
     budget.initialized = true;
     budget.shared_available = available;
     budget.weight_available = available - runtime_reserve;
-    budget.runtime_available = runtime_reserve;
+    budget.runtime_guaranteed = runtime_reserve;
     budget.total = total;
     if (combined) {
-        GGML_LOG_DEBUG("%s: device %d captured %.2f MiB weight and %.2f MiB runtime prefetch budgets "
+        GGML_LOG_DEBUG("%s: device %d captured %.2f MiB maximum weight budget and %.2f MiB guaranteed runtime reserve "
                 "before managed allocation (free %.2f MiB of %.2f MiB, safety headroom %.2f MiB)\n",
                 __func__, device, budget.weight_available / 1024.0 / 1024.0,
-                budget.runtime_available / 1024.0 / 1024.0, free / 1024.0 / 1024.0,
+                budget.runtime_guaranteed / 1024.0 / 1024.0, free / 1024.0 / 1024.0,
                 total / 1024.0 / 1024.0, headroom / 1024.0 / 1024.0);
     } else {
         GGML_LOG_DEBUG("%s: device %d captured %.2f MiB shared prefetch budget before managed allocation "
@@ -440,7 +440,7 @@ static size_t ggml_cuda_managed_prefetch_range(
             budget.initialized = true;
             budget.shared_available = available;
             budget.weight_available = available - runtime_reserve;
-            budget.runtime_available = runtime_reserve;
+            budget.runtime_guaranteed = runtime_reserve;
             budget.total = total;
         } else {
             (void) cudaGetLastError();
@@ -458,10 +458,26 @@ static size_t ggml_cuda_managed_prefetch_range(
     }
 
     size_t & reserved = combined ?
-            (runtime ? budget.runtime_reserved : budget.weight_reserved) : budget.shared_reserved;
-    const size_t available = combined ?
-            (runtime ? budget.runtime_available : budget.weight_available) : budget.shared_available;
-    const size_t remaining = reserved < available ? available - reserved : 0;
+            (runtime ? budget.runtime_prefetched : budget.weight_reserved) : budget.shared_reserved;
+    size_t available = budget.shared_available;
+    size_t remaining = reserved < available ? available - reserved : 0;
+    if (combined) {
+        const size_t total_reserved = budget.weight_reserved + budget.runtime_prefetched;
+        const size_t total_remaining = total_reserved < budget.shared_available ?
+                budget.shared_available - total_reserved : 0;
+        if (runtime) {
+            // The runtime reserve is a guaranteed minimum, not a maximum.
+            // Runtime allocations may also consume any weight capacity which
+            // the model did not use, without exceeding the total VRAM budget.
+            available = budget.shared_available - budget.weight_reserved;
+            remaining = total_remaining;
+        } else {
+            available = budget.weight_available;
+            const size_t weight_remaining = budget.weight_reserved < budget.weight_available ?
+                    budget.weight_available - budget.weight_reserved : 0;
+            remaining = std::min(weight_remaining, total_remaining);
+        }
+    }
     const size_t prefetch_size = std::min(size, remaining);
     if (prefetch_size == 0) {
         if (combined) {
