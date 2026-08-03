@@ -189,26 +189,86 @@ static cudaError_t ggml_cuda_mem_prefetch_async_host(const void * ptr, size_t si
 #endif
 }
 
-static void ggml_cuda_managed_advise(void * ptr, size_t size, int device) {
+static bool ggml_cuda_managed_advise_range(const void * ptr, size_t size, int device) {
 #if defined(GGML_USE_MUSA)
     GGML_UNUSED(ptr);
     GGML_UNUSED(size);
     GGML_UNUSED(device);
+    return false;
 #else
-    if (getenv("GGML_CUDA_MANAGED_ADVISE") == nullptr) {
-        return;
-    }
-
     cudaError_t err = ggml_cuda_mem_advise_host(ptr, size, cudaMemAdviseSetPreferredLocation);
+    bool success = true;
     if (err != cudaSuccess) {
         (void)cudaGetLastError();
+        success = false;
     }
 
     err = ggml_cuda_mem_advise_device(ptr, size, cudaMemAdviseSetAccessedBy, device);
     if (err != cudaSuccess) {
         (void)cudaGetLastError();
+        success = false;
     }
+    return success;
 #endif // defined(GGML_USE_MUSA)
+}
+
+static size_t ggml_cuda_managed_prefetch_headroom();
+
+struct ggml_cuda_managed_prefetch_budget {
+    bool initialized = false;
+    size_t available = 0;
+    size_t reserved = 0;
+    size_t total = 0;
+};
+
+struct ggml_cuda_managed_prefetch_state {
+    std::mutex mutex;
+    std::array<ggml_cuda_managed_prefetch_budget, GGML_CUDA_MAX_DEVICES> devices;
+};
+
+static ggml_cuda_managed_prefetch_state & ggml_cuda_managed_prefetch_state_instance() {
+    static ggml_cuda_managed_prefetch_state state;
+    return state;
+}
+
+static void ggml_cuda_managed_prefetch_init_budget(int device) {
+    if (getenv("GGML_CUDA_MANAGED_PREFETCH") == nullptr ||
+            device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
+        return;
+    }
+
+    ggml_cuda_managed_prefetch_state & state = ggml_cuda_managed_prefetch_state_instance();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    ggml_cuda_managed_prefetch_budget & budget = state.devices[device];
+    if (budget.initialized) {
+        return;
+    }
+
+    size_t free = 0;
+    size_t total = 0;
+    cudaError_t err = cudaMemGetInfo(&free, &total);
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        return;
+    }
+
+    const size_t headroom = std::min(free, ggml_cuda_managed_prefetch_headroom());
+    budget.initialized = true;
+    budget.available = free - headroom;
+    budget.total = total;
+    GGML_LOG_DEBUG("%s: device %d captured %.2f MiB prefetch budget before managed allocation "
+            "(free %.2f MiB of %.2f MiB, headroom %.2f MiB)\n",
+            __func__, device, budget.available / 1024.0 / 1024.0, free / 1024.0 / 1024.0,
+            total / 1024.0 / 1024.0, headroom / 1024.0 / 1024.0);
+}
+
+static void ggml_cuda_managed_advise(void * ptr, size_t size, int device) {
+    if (getenv("GGML_CUDA_MANAGED_ADVISE") == nullptr ||
+            getenv("GGML_CUDA_MANAGED_PREFETCH") != nullptr) {
+        return;
+    }
+
+    (void) ggml_cuda_managed_advise_range(ptr, size, device);
 }
 
 static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device, bool * managed) {
@@ -218,6 +278,10 @@ static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device,
         *managed = false;
     }
     if (getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") != nullptr) {
+        // Capture the logical migration budget before managed allocations and
+        // their initialization can change cudaMemGetInfo(). Both prefetch-only
+        // and combined mode consume this same budget.
+        ggml_cuda_managed_prefetch_init_budget(device);
         GGML_LOG_WARN("UVM CHECK: cudaMallocManaged %.2f MiB on device %d\n",
                   size / 1024.0 / 1024.0, device);
         err = cudaMallocManaged(ptr, size);
@@ -286,82 +350,81 @@ static size_t ggml_cuda_managed_prefetch_range(const void * ptr, size_t size, in
         return 0;
     }
 
-    // Serialize the free-memory query with the migration. Otherwise simultaneous
-    // callers could each observe and consume the same available VRAM.
-    static std::mutex mutex;
-    std::lock_guard<std::mutex> lock(mutex);
+    // Serialize migrations so simultaneous callers cannot consume the same
+    // part of the logical per-device budget.
+    ggml_cuda_managed_prefetch_state & state = ggml_cuda_managed_prefetch_state_instance();
+    std::lock_guard<std::mutex> lock(state.mutex);
 
     ggml_cuda_set_device(device);
 
-    size_t free = 0;
-    size_t total = 0;
-    cudaError_t err = cudaMemGetInfo(&free, &total);
-    if (err != cudaSuccess) {
-        (void) cudaGetLastError();
+    // In combined mode, defer advice until the prefetch result is known. This
+    // keeps successfully prefetched bytes on the exact same path as
+    // prefetch-only and applies host mapping only to actual overflow.
+    const bool advise_overflow = getenv("GGML_CUDA_MANAGED_ADVISE") != nullptr &&
+            getenv("GGML_CUDA_MANAGED_PREFETCH") != nullptr;
+
+    ggml_cuda_managed_prefetch_budget & budget = state.devices[device];
+    if (!budget.initialized) {
+        size_t free = 0;
+        size_t total = 0;
+        cudaError_t err = cudaMemGetInfo(&free, &total);
+        if (err == cudaSuccess) {
+            const size_t headroom = std::min(free, ggml_cuda_managed_prefetch_headroom());
+            budget.initialized = true;
+            budget.available = free - headroom;
+            budget.total = total;
+        } else {
+            (void) cudaGetLastError();
+        }
+    }
+
+    if (!budget.initialized) {
+        if (advise_overflow) {
+            const bool advised = ggml_cuda_managed_advise_range(ptr, size, device);
+            GGML_LOG_DEBUG("%s: device %d could not query free VRAM; %s %.2f MiB allocation\n",
+                    __func__, device, advised ? "advised" : "failed to fully advise", size / 1024.0 / 1024.0);
+        }
         return 0;
     }
 
-    const size_t headroom = std::min(free, ggml_cuda_managed_prefetch_headroom());
-    const size_t budget = free - headroom;
-    const size_t prefetch_size = std::min(size, budget);
+    const size_t remaining = budget.reserved < budget.available ? budget.available - budget.reserved : 0;
+    const size_t prefetch_size = std::min(size, remaining);
     if (prefetch_size == 0) {
+        if (advise_overflow) {
+            const bool advised = ggml_cuda_managed_advise_range(ptr, size, device);
+            GGML_LOG_DEBUG("%s: device %d has no prefetch budget; %s %.2f MiB allocation\n",
+                    __func__, device, advised ? "advised" : "failed to fully advise", size / 1024.0 / 1024.0);
+        }
         return 0;
     }
 
-    // Allocations start out host-preferred and GPU-mapped so that any part
-    // which cannot be prefetched remains accessible from system memory. Clear
-    // both hints from the selected prefix before migration. The prefetch then
-    // establishes the normal GPU-resident mapping, just as it does when advice
-    // is disabled, without invalidating that mapping after migration.
-    //
-    // If the whole allocation fits, advise + prefetch is left with the same
-    // placement and mapping policy as prefetch alone. If it only partially
-    // fits, the unprefetched suffix keeps both of its original hints.
-    const bool advise = getenv("GGML_CUDA_MANAGED_ADVISE") != nullptr;
-    bool cleared_preferred_location = false;
-    bool cleared_accessed_by = false;
-    if (advise) {
-        err = ggml_cuda_mem_advise_host(ptr, prefetch_size, cudaMemAdviseUnsetPreferredLocation);
-        if (err == cudaSuccess) {
-            cleared_preferred_location = true;
-        } else {
-            GGML_LOG_DEBUG("%s: device %d failed to clear preferred location for prefetch: %s\n",
-                    __func__, device, cudaGetErrorString(err));
-            (void) cudaGetLastError();
-        }
-
-        err = ggml_cuda_mem_advise_device(ptr, prefetch_size, cudaMemAdviseUnsetAccessedBy, device);
-        if (err == cudaSuccess) {
-            cleared_accessed_by = true;
-        } else {
-            GGML_LOG_DEBUG("%s: device %d failed to clear GPU mapping advice before prefetch: %s\n",
-                    __func__, device, cudaGetErrorString(err));
-            (void) cudaGetLastError();
-        }
-    }
-
-    err = ggml_cuda_mem_prefetch_async(ptr, prefetch_size, device, cudaStreamPerThread);
+    cudaError_t err = ggml_cuda_mem_prefetch_async(ptr, prefetch_size, device, cudaStreamPerThread);
     if (err != cudaSuccess) {
         (void) cudaGetLastError();
-
-        // The range did not migrate, so restore any overflow advice which was
-        // successfully cleared above.
-        if (cleared_preferred_location) {
-            (void) ggml_cuda_mem_advise_host(ptr, prefetch_size, cudaMemAdviseSetPreferredLocation);
+        if (advise_overflow) {
+            const bool advised = ggml_cuda_managed_advise_range(ptr, size, device);
+            GGML_LOG_DEBUG("%s: device %d prefetch failed; %s %.2f MiB allocation\n",
+                    __func__, device, advised ? "advised" : "failed to fully advise", size / 1024.0 / 1024.0);
         }
-        if (cleared_accessed_by) {
-            (void) ggml_cuda_mem_advise_device(ptr, prefetch_size, cudaMemAdviseSetAccessedBy, device);
-        }
-        (void) cudaGetLastError();
         return 0;
     }
 
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    budget.reserved += prefetch_size;
+
+    if (advise_overflow && prefetch_size < size) {
+        const void * overflow_ptr = (const char *) ptr + prefetch_size;
+        const bool advised = ggml_cuda_managed_advise_range(overflow_ptr, size - prefetch_size, device);
+        GGML_LOG_DEBUG("%s: device %d %s %.2f MiB overflow after prefetch\n",
+                __func__, device, advised ? "advised" : "failed to fully advise",
+                (size - prefetch_size) / 1024.0 / 1024.0);
+    }
 
     GGML_LOG_DEBUG("%s: device %d prefetched %.2f MiB of %.2f MiB "
-            "(free %.2f MiB of %.2f MiB, headroom %.2f MiB)\n",
+            "(reserved %.2f MiB of %.2f MiB budget, total VRAM %.2f MiB)\n",
             __func__, device, prefetch_size / 1024.0 / 1024.0, size / 1024.0 / 1024.0,
-            free / 1024.0 / 1024.0, total / 1024.0 / 1024.0, headroom / 1024.0 / 1024.0);
+            budget.reserved / 1024.0 / 1024.0, budget.available / 1024.0 / 1024.0,
+            budget.total / 1024.0 / 1024.0);
     return prefetch_size;
 #endif // defined(GGML_USE_MUSA)
 }
