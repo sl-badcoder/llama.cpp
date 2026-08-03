@@ -308,39 +308,55 @@ static size_t ggml_cuda_managed_prefetch_range(const void * ptr, size_t size, in
         return 0;
     }
 
-    err = ggml_cuda_mem_prefetch_async(ptr, prefetch_size, device, cudaStreamPerThread);
-    if (err != cudaSuccess) {
-        (void) cudaGetLastError();
-        return 0;
-    }
-
-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
-
     // Allocations start out host-preferred and GPU-mapped so that any part
-    // which cannot be prefetched remains accessible from system memory. Once
-    // a range has actually migrated to the GPU, remove both hints from that
-    // exact range. Otherwise a later host access can leave it host-resident and
-    // SetAccessedBy allows the GPU to keep accessing it remotely instead of
-    // migrating it back.
+    // which cannot be prefetched remains accessible from system memory. Clear
+    // both hints from the selected prefix before migration. The prefetch then
+    // establishes the normal GPU-resident mapping, just as it does when advice
+    // is disabled, without invalidating that mapping after migration.
     //
-    // If the whole allocation fits, advise + prefetch is therefore left with
-    // the same policy as prefetch alone. If it only partially fits, the
-    // unprefetched suffix keeps its original host preference and GPU mapping.
-    if (getenv("GGML_CUDA_MANAGED_ADVISE") != nullptr) {
+    // If the whole allocation fits, advise + prefetch is left with the same
+    // placement and mapping policy as prefetch alone. If it only partially
+    // fits, the unprefetched suffix keeps both of its original hints.
+    const bool advise = getenv("GGML_CUDA_MANAGED_ADVISE") != nullptr;
+    bool cleared_preferred_location = false;
+    bool cleared_accessed_by = false;
+    if (advise) {
         err = ggml_cuda_mem_advise_host(ptr, prefetch_size, cudaMemAdviseUnsetPreferredLocation);
-        if (err != cudaSuccess) {
-            GGML_LOG_DEBUG("%s: device %d failed to clear preferred location for prefetched range: %s\n",
+        if (err == cudaSuccess) {
+            cleared_preferred_location = true;
+        } else {
+            GGML_LOG_DEBUG("%s: device %d failed to clear preferred location for prefetch: %s\n",
                     __func__, device, cudaGetErrorString(err));
             (void) cudaGetLastError();
         }
 
         err = ggml_cuda_mem_advise_device(ptr, prefetch_size, cudaMemAdviseUnsetAccessedBy, device);
-        if (err != cudaSuccess) {
-            GGML_LOG_DEBUG("%s: device %d failed to clear GPU mapping advice for prefetched range: %s\n",
+        if (err == cudaSuccess) {
+            cleared_accessed_by = true;
+        } else {
+            GGML_LOG_DEBUG("%s: device %d failed to clear GPU mapping advice before prefetch: %s\n",
                     __func__, device, cudaGetErrorString(err));
             (void) cudaGetLastError();
         }
     }
+
+    err = ggml_cuda_mem_prefetch_async(ptr, prefetch_size, device, cudaStreamPerThread);
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+
+        // The range did not migrate, so restore any overflow advice which was
+        // successfully cleared above.
+        if (cleared_preferred_location) {
+            (void) ggml_cuda_mem_advise_host(ptr, prefetch_size, cudaMemAdviseSetPreferredLocation);
+        }
+        if (cleared_accessed_by) {
+            (void) ggml_cuda_mem_advise_device(ptr, prefetch_size, cudaMemAdviseSetAccessedBy, device);
+        }
+        (void) cudaGetLastError();
+        return 0;
+    }
+
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 
     GGML_LOG_DEBUG("%s: device %d prefetched %.2f MiB of %.2f MiB "
             "(free %.2f MiB of %.2f MiB, headroom %.2f MiB)\n",
