@@ -305,13 +305,10 @@ static void ggml_cuda_managed_advise(void * ptr, size_t size, int device) {
     }
 
     if (getenv("GGML_CUDA_MANAGED_PREFETCH") != nullptr) {
-        // Combined mode maps every allocation on the GPU up front, but does
-        // not make prefetched bytes CPU-preferred. The overflow receives that
-        // placement hint after the prefetch decision is known.
-        if (!ggml_cuda_managed_map_range(ptr, size, device)) {
-            GGML_LOG_DEBUG("%s: device %d failed to map %.2f MiB managed allocation\n",
-                    __func__, device, size / 1024.0 / 1024.0);
-        }
+        // Combined mode defers mapping until the post-initialization prefetch
+        // pass. This avoids establishing GPU mappings while newly allocated
+        // managed pages may still be host-backed.
+        return;
     } else {
         (void) ggml_cuda_managed_advise_range(ptr, size, device);
     }
@@ -427,6 +424,16 @@ static size_t ggml_cuda_managed_prefetch_range(
     // weight and runtime budgets so that weights cannot consume the runtime reserve.
     const bool runtime = priority == ggml_cuda_managed_prefetch_priority::runtime;
     const bool combined = getenv("GGML_CUDA_MANAGED_ADVISE") != nullptr;
+
+    // Model and split buffers reach this point after their tensor uploads;
+    // graph compute and KV buffers reach it after context initialization.
+    // Establish the requested GPU mapping immediately before migration.
+    if (combined) {
+        const bool mapped = ggml_cuda_managed_map_range(ptr, size, device);
+        GGML_LOG_DEBUG("%s: device %d %s %.2f MiB %s allocation immediately before prefetch\n",
+                __func__, device, mapped ? "mapped" : "failed to map",
+                size / 1024.0 / 1024.0, runtime ? "runtime" : "weight");
+    }
 
     ggml_cuda_managed_prefetch_budget & budget = state.devices[device];
     if (!budget.initialized) {
