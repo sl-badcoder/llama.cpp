@@ -189,35 +189,59 @@ static cudaError_t ggml_cuda_mem_prefetch_async_host(const void * ptr, size_t si
 #endif
 }
 
-static bool ggml_cuda_managed_advise_range(const void * ptr, size_t size, int device) {
+static bool ggml_cuda_managed_map_range(const void * ptr, size_t size, int device) {
 #if defined(GGML_USE_MUSA)
     GGML_UNUSED(ptr);
     GGML_UNUSED(size);
     GGML_UNUSED(device);
     return false;
 #else
-    cudaError_t err = ggml_cuda_mem_advise_host(ptr, size, cudaMemAdviseSetPreferredLocation);
-    bool success = true;
+    cudaError_t err = ggml_cuda_mem_advise_device(ptr, size, cudaMemAdviseSetAccessedBy, device);
     if (err != cudaSuccess) {
         (void)cudaGetLastError();
-        success = false;
+        return false;
     }
-
-    err = ggml_cuda_mem_advise_device(ptr, size, cudaMemAdviseSetAccessedBy, device);
-    if (err != cudaSuccess) {
-        (void)cudaGetLastError();
-        success = false;
-    }
-    return success;
+    return true;
 #endif // defined(GGML_USE_MUSA)
 }
 
+static bool ggml_cuda_managed_prefer_host_range(const void * ptr, size_t size) {
+#if defined(GGML_USE_MUSA)
+    GGML_UNUSED(ptr);
+    GGML_UNUSED(size);
+    return false;
+#else
+    cudaError_t err = ggml_cuda_mem_advise_host(ptr, size, cudaMemAdviseSetPreferredLocation);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        return false;
+    }
+    return true;
+#endif // defined(GGML_USE_MUSA)
+}
+
+static bool ggml_cuda_managed_advise_range(const void * ptr, size_t size, int device) {
+    const bool preferred = ggml_cuda_managed_prefer_host_range(ptr, size);
+    const bool mapped = ggml_cuda_managed_map_range(ptr, size, device);
+    return preferred && mapped;
+}
+
 static size_t ggml_cuda_managed_prefetch_headroom();
+static size_t ggml_cuda_managed_runtime_reserve();
+
+enum class ggml_cuda_managed_prefetch_priority {
+    model_weights,
+    runtime,
+};
 
 struct ggml_cuda_managed_prefetch_budget {
     bool initialized = false;
-    size_t available = 0;
-    size_t reserved = 0;
+    size_t shared_available = 0;
+    size_t shared_reserved = 0;
+    size_t weight_available = 0;
+    size_t weight_reserved = 0;
+    size_t runtime_available = 0;
+    size_t runtime_reserved = 0;
     size_t total = 0;
 };
 
@@ -230,11 +254,6 @@ static ggml_cuda_managed_prefetch_state & ggml_cuda_managed_prefetch_state_insta
     static ggml_cuda_managed_prefetch_state state;
     return state;
 }
-
-enum class ggml_cuda_managed_prefetch_priority {
-    model_weights,
-    runtime,
-};
 
 static void ggml_cuda_managed_prefetch_init_budget(int device) {
     if (getenv("GGML_CUDA_MANAGED_PREFETCH") == nullptr ||
@@ -258,22 +277,44 @@ static void ggml_cuda_managed_prefetch_init_budget(int device) {
     }
 
     const size_t headroom = std::min(free, ggml_cuda_managed_prefetch_headroom());
+    const size_t available = free - headroom;
+    const bool combined = getenv("GGML_CUDA_MANAGED_ADVISE") != nullptr;
+    const size_t runtime_reserve = combined ? std::min(available, ggml_cuda_managed_runtime_reserve()) : 0;
     budget.initialized = true;
-    budget.available = free - headroom;
+    budget.shared_available = available;
+    budget.weight_available = available - runtime_reserve;
+    budget.runtime_available = runtime_reserve;
     budget.total = total;
-    GGML_LOG_DEBUG("%s: device %d captured %.2f MiB prefetch budget before managed allocation "
-            "(free %.2f MiB of %.2f MiB, headroom %.2f MiB)\n",
-            __func__, device, budget.available / 1024.0 / 1024.0, free / 1024.0 / 1024.0,
-            total / 1024.0 / 1024.0, headroom / 1024.0 / 1024.0);
+    if (combined) {
+        GGML_LOG_DEBUG("%s: device %d captured %.2f MiB weight and %.2f MiB runtime prefetch budgets "
+                "before managed allocation (free %.2f MiB of %.2f MiB, safety headroom %.2f MiB)\n",
+                __func__, device, budget.weight_available / 1024.0 / 1024.0,
+                budget.runtime_available / 1024.0 / 1024.0, free / 1024.0 / 1024.0,
+                total / 1024.0 / 1024.0, headroom / 1024.0 / 1024.0);
+    } else {
+        GGML_LOG_DEBUG("%s: device %d captured %.2f MiB shared prefetch budget before managed allocation "
+                "(free %.2f MiB of %.2f MiB, safety headroom %.2f MiB)\n",
+                __func__, device, budget.shared_available / 1024.0 / 1024.0,
+                free / 1024.0 / 1024.0, total / 1024.0 / 1024.0, headroom / 1024.0 / 1024.0);
+    }
 }
 
 static void ggml_cuda_managed_advise(void * ptr, size_t size, int device) {
-    if (getenv("GGML_CUDA_MANAGED_ADVISE") == nullptr ||
-            getenv("GGML_CUDA_MANAGED_PREFETCH") != nullptr) {
+    if (getenv("GGML_CUDA_MANAGED_ADVISE") == nullptr) {
         return;
     }
 
-    (void) ggml_cuda_managed_advise_range(ptr, size, device);
+    if (getenv("GGML_CUDA_MANAGED_PREFETCH") != nullptr) {
+        // Combined mode maps every allocation on the GPU up front, but does
+        // not make prefetched bytes CPU-preferred. The overflow receives that
+        // placement hint after the prefetch decision is known.
+        if (!ggml_cuda_managed_map_range(ptr, size, device)) {
+            GGML_LOG_DEBUG("%s: device %d failed to map %.2f MiB managed allocation\n",
+                    __func__, device, size / 1024.0 / 1024.0);
+        }
+    } else {
+        (void) ggml_cuda_managed_advise_range(ptr, size, device);
+    }
 }
 
 static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device, bool * managed) {
@@ -344,6 +385,23 @@ static size_t ggml_cuda_managed_prefetch_headroom() {
     return (size_t) headroom_mib * 1024 * 1024;
 }
 
+static size_t ggml_cuda_managed_runtime_reserve() {
+    static constexpr size_t default_reserve = 2048 * 1024 * 1024ull;
+    const char * value = getenv("GGML_CUDA_MANAGED_RUNTIME_RESERVE");
+    if (value == nullptr) {
+        return default_reserve;
+    }
+
+    char * end = nullptr;
+    const unsigned long long reserve_mib = strtoull(value, &end, 10);
+    if (end == value || *end != '\0' || reserve_mib > std::numeric_limits<size_t>::max() / (1024 * 1024)) {
+        GGML_LOG_WARN_ONCE("invalid GGML_CUDA_MANAGED_RUNTIME_RESERVE; using 2048 MiB\n");
+        return default_reserve;
+    }
+
+    return (size_t) reserve_mib * 1024 * 1024;
+}
+
 static size_t ggml_cuda_managed_prefetch_range(
         const void * ptr, size_t size, int device, ggml_cuda_managed_prefetch_priority priority) {
 #if defined(GGML_USE_MUSA)
@@ -364,87 +422,87 @@ static size_t ggml_cuda_managed_prefetch_range(
 
     ggml_cuda_set_device(device);
 
-    // In combined mode, defer weight advice until the prefetch result is known.
-    // Runtime allocations (KV cache, compute buffers and scratch) always take
-    // priority: migrate them in full and let UVM evict weight pages if needed.
-    // Host-preferred advice is therefore only ever applied to model weights.
+    // Prefetch-only uses one shared budget and never calls cudaMemAdvise.
+    // Combined mode maps every allocation, then uses separate non-overlapping
+    // weight and runtime budgets so that weights cannot consume the runtime reserve.
     const bool runtime = priority == ggml_cuda_managed_prefetch_priority::runtime;
-    const bool advise_overflow = getenv("GGML_CUDA_MANAGED_ADVISE") != nullptr &&
-            getenv("GGML_CUDA_MANAGED_PREFETCH") != nullptr && !runtime;
+    const bool combined = getenv("GGML_CUDA_MANAGED_ADVISE") != nullptr;
 
     ggml_cuda_managed_prefetch_budget & budget = state.devices[device];
-    if (!runtime && !budget.initialized) {
+    if (!budget.initialized) {
         size_t free = 0;
         size_t total = 0;
         cudaError_t err = cudaMemGetInfo(&free, &total);
         if (err == cudaSuccess) {
             const size_t headroom = std::min(free, ggml_cuda_managed_prefetch_headroom());
+            const size_t available = free - headroom;
+            const size_t runtime_reserve = combined ? std::min(available, ggml_cuda_managed_runtime_reserve()) : 0;
             budget.initialized = true;
-            budget.available = free - headroom;
+            budget.shared_available = available;
+            budget.weight_available = available - runtime_reserve;
+            budget.runtime_available = runtime_reserve;
             budget.total = total;
         } else {
             (void) cudaGetLastError();
         }
     }
 
-    if (!runtime && !budget.initialized) {
-        if (advise_overflow) {
-            const bool advised = ggml_cuda_managed_advise_range(ptr, size, device);
+    if (!budget.initialized) {
+        if (combined) {
+            const bool advised = ggml_cuda_managed_prefer_host_range(ptr, size);
             GGML_LOG_DEBUG("%s: device %d could not query free VRAM; %s %.2f MiB allocation\n",
-                    __func__, device, advised ? "advised" : "failed to fully advise", size / 1024.0 / 1024.0);
+                    __func__, device, advised ? "made host-preferred" : "failed to set host preference for",
+                    size / 1024.0 / 1024.0);
         }
         return 0;
     }
 
-    const size_t remaining = budget.reserved < budget.available ? budget.available - budget.reserved : 0;
-    const size_t prefetch_size = runtime ? size : std::min(size, remaining);
+    size_t & reserved = combined ?
+            (runtime ? budget.runtime_reserved : budget.weight_reserved) : budget.shared_reserved;
+    const size_t available = combined ?
+            (runtime ? budget.runtime_available : budget.weight_available) : budget.shared_available;
+    const size_t remaining = reserved < available ? available - reserved : 0;
+    const size_t prefetch_size = std::min(size, remaining);
     if (prefetch_size == 0) {
-        if (advise_overflow) {
-            const bool advised = ggml_cuda_managed_advise_range(ptr, size, device);
-            GGML_LOG_DEBUG("%s: device %d has no prefetch budget; %s %.2f MiB allocation\n",
-                    __func__, device, advised ? "advised" : "failed to fully advise", size / 1024.0 / 1024.0);
+        if (combined) {
+            const bool advised = ggml_cuda_managed_prefer_host_range(ptr, size);
+            GGML_LOG_DEBUG("%s: device %d has no %s prefetch budget; %s %.2f MiB allocation\n",
+                    __func__, device, runtime ? "runtime" : "weight", advised ? "made host-preferred" :
+                    "failed to set host preference for", size / 1024.0 / 1024.0);
         }
         return 0;
     }
 
     cudaError_t err = ggml_cuda_mem_prefetch_async(ptr, prefetch_size, device, cudaStreamPerThread);
     if (err != cudaSuccess) {
-        if (runtime) {
-            GGML_LOG_DEBUG("%s: device %d failed to prefetch %.2f MiB priority runtime allocation: %s\n",
-                    __func__, device, size / 1024.0 / 1024.0, cudaGetErrorString(err));
-        }
         (void) cudaGetLastError();
-        if (advise_overflow) {
-            const bool advised = ggml_cuda_managed_advise_range(ptr, size, device);
-            GGML_LOG_DEBUG("%s: device %d prefetch failed; %s %.2f MiB allocation\n",
-                    __func__, device, advised ? "advised" : "failed to fully advise", size / 1024.0 / 1024.0);
+        if (combined) {
+            const bool advised = ggml_cuda_managed_prefer_host_range(ptr, size);
+            GGML_LOG_DEBUG("%s: device %d %s prefetch failed; %s %.2f MiB allocation\n",
+                    __func__, device, runtime ? "runtime" : "weight",
+                    advised ? "made host-preferred" : "failed to set host preference for",
+                    size / 1024.0 / 1024.0);
         }
         return 0;
     }
 
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
-    if (!runtime) {
-        budget.reserved += prefetch_size;
-    }
+    reserved += prefetch_size;
 
-    if (advise_overflow && prefetch_size < size) {
+    if (combined && prefetch_size < size) {
         const void * overflow_ptr = (const char *) ptr + prefetch_size;
-        const bool advised = ggml_cuda_managed_advise_range(overflow_ptr, size - prefetch_size, device);
-        GGML_LOG_DEBUG("%s: device %d %s %.2f MiB overflow after prefetch\n",
-                __func__, device, advised ? "advised" : "failed to fully advise",
-                (size - prefetch_size) / 1024.0 / 1024.0);
+        const bool advised = ggml_cuda_managed_prefer_host_range(overflow_ptr, size - prefetch_size);
+        GGML_LOG_DEBUG("%s: device %d %s %.2f MiB %s overflow after prefetch\n",
+                __func__, device, advised ? "made host-preferred" : "failed to set host preference for",
+                (size - prefetch_size) / 1024.0 / 1024.0, runtime ? "runtime" : "weight");
     }
 
-    if (runtime) {
-        GGML_LOG_DEBUG("%s: device %d prefetched full %.2f MiB priority runtime allocation\n",
-                __func__, device, prefetch_size / 1024.0 / 1024.0);
-    } else {
-        GGML_LOG_DEBUG("%s: device %d prefetched %.2f MiB of %.2f MiB model weights "
-                "(reserved %.2f MiB of %.2f MiB budget, total VRAM %.2f MiB)\n",
-                __func__, device, prefetch_size / 1024.0 / 1024.0, size / 1024.0 / 1024.0,
-                budget.reserved / 1024.0 / 1024.0, budget.available / 1024.0 / 1024.0,
-                budget.total / 1024.0 / 1024.0);
-    }
+    GGML_LOG_DEBUG("%s: device %d prefetched %.2f MiB of %.2f MiB %s allocation "
+            "(reserved %.2f MiB of %.2f MiB %s budget, total VRAM %.2f MiB)\n",
+            __func__, device, prefetch_size / 1024.0 / 1024.0, size / 1024.0 / 1024.0,
+            combined ? (runtime ? "runtime" : "weight") : "shared", reserved / 1024.0 / 1024.0,
+            available / 1024.0 / 1024.0, combined ? (runtime ? "runtime" : "weight") : "shared",
+            budget.total / 1024.0 / 1024.0);
     return prefetch_size;
 #endif // defined(GGML_USE_MUSA)
 }
