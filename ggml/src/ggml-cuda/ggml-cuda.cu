@@ -1056,7 +1056,10 @@ size_t ggml_backend_cuda_buffer_prefetch_to_device(ggml_backend_buffer_t buffer)
     }
 
     if (ggml_backend_buffer_is_cuda(buffer)) {
-        return ggml_backend_cuda_managed_prefetch_buffer_once(buffer);
+        ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+        ctx->automatic_prefetch_attempted.store(true);
+        return ggml_backend_cuda_managed_prefetch_range(
+                buffer, ggml_backend_buffer_get_base(buffer), ggml_backend_buffer_get_size(buffer), ctx->device);
     }
 
     return ggml_backend_cuda_split_buffer_prefetch_to_device(buffer);
@@ -1432,9 +1435,7 @@ static size_t ggml_backend_cuda_split_buffer_prefetch_to_device(ggml_backend_buf
     }
 
     ggml_backend_cuda_split_buffer_context * ctx = (ggml_backend_cuda_split_buffer_context *) buffer->context;
-    if (ctx->automatic_prefetch_attempted.exchange(true)) {
-        return 0;
-    }
+    ctx->automatic_prefetch_attempted.store(true);
 
     size_t size_prefetched = 0;
     for (ggml_tensor_extra_gpu * extra : ctx->tensor_extras) {
