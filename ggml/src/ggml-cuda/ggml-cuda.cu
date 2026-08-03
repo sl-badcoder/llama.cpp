@@ -1173,7 +1173,12 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
 
     if (ctx->managed) {
         void * dst = (char *) tensor->data + offset;
-        std::memcpy(dst, data, size);
+        // Graph inputs are updated by the CPU before every execution. Copy them explicitly so
+        // that writing tokens, positions, and other inputs does not fault managed compute pages
+        // back to the host immediately before the GPU consumes them.
+        ggml_cuda_set_device(ctx->device);
+        CUDA_CHECK(cudaMemcpyAsync(dst, data, size, cudaMemcpyDefault, cudaStreamPerThread));
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
         return;
     }
 
@@ -1208,9 +1213,10 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
     if (ctx->managed) {
         char * dst = (char *) tensor->data + offset;
         const char * src = (const char *) data;
-        for (size_t i = 0; i < n_copies; ++i) {
-            std::memcpy(dst + i * stride_tensor, src + i * stride_data, size);
-        }
+        ggml_cuda_set_device(ctx->device);
+        CUDA_CHECK(cudaMemcpy2DAsync(
+            dst, stride_tensor, src, stride_data, size, n_copies, cudaMemcpyDefault, cudaStreamPerThread));
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
         return;
     }
 
