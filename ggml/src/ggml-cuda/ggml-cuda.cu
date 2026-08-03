@@ -3845,11 +3845,11 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
     ggml_backend_cuda_buffer_context * buf_ctx = (ggml_backend_cuda_buffer_context *) buf->context;
     if (buf_ctx->managed) {
         const void * src = (const char *) tensor->data + offset;
-        if (getenv("GGML_CUDA_MANAGED_PREFETCH") != nullptr && size > 0) {
-            CUDA_CHECK(ggml_cuda_mem_prefetch_async_host(src, size, cuda_ctx->stream()));
-        }
-        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
-        std::memcpy(data, src, size);
+        // Copy managed results explicitly instead of migrating their backing pages to the CPU.
+        // In particular, logits are read after every generated token. Keeping the source pages
+        // GPU-resident avoids moving a part of the managed compute buffer back and forth for each
+        // graph execution. Completion is handled by the normal backend/context synchronization.
+        CUDA_CHECK(cudaMemcpyAsync(data, src, size, cudaMemcpyDefault, cuda_ctx->stream()));
         return;
     }
 
@@ -3888,14 +3888,8 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
     if (buf_ctx->managed) {
         const char * src = (const char *) tensor->data + offset;
         char * dst = (char *) data;
-        if (getenv("GGML_CUDA_MANAGED_PREFETCH") != nullptr && size > 0 && n_copies > 0) {
-            const size_t span = (n_copies - 1) * stride_tensor + size;
-            CUDA_CHECK(ggml_cuda_mem_prefetch_async_host(src, span, cuda_ctx->stream()));
-        }
-        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
-        for (size_t i = 0; i < n_copies; ++i) {
-            std::memcpy(dst + i * stride_data, src + i * stride_tensor, size);
-        }
+        CUDA_CHECK(cudaMemcpy2DAsync(
+            dst, stride_data, src, stride_tensor, size, n_copies, cudaMemcpyDefault, cuda_ctx->stream()));
         return;
     }
 
